@@ -1,4 +1,3 @@
-# +
 import os
 import os.path as osp
 import random
@@ -16,6 +15,7 @@ import SimpleITK as sitk
 import pydicom
 import scipy.io
 import glob
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torch.utils.data import Dataset
 
@@ -852,8 +852,8 @@ class Med2Transformer(nn.Module):
         x3a = self.MSwinBlock3(x3a)
 
         x3b = self.MSwinBlock4(x3)
-        x3b = self.MSwinBlock3(x3b)
-        x3b = self.MSwinBlock4(x3b)
+        x3b = self.MSwinBlock5(x3b)
+        x3b = self.MSwinBlock6(x3b)
 
         x3c_concat = torch.cat([x3a, x3b], dim=1)
         x3 = self.aggregate3(x3c_concat)
@@ -1073,7 +1073,7 @@ class wave3DDiscriminator(nn.Module):
         x_wave = torch.zeros(
             [T, 5 * C, D, H // 2, W // 2],
             device=device,
-            requires_grad=not isDetach,
+            dtype=input.dtype,
         )
 
         x_wave = x_wave.clone()
@@ -1946,32 +1946,32 @@ class GANclass(nn.Module):
         """
         One training step (D then G).
         If `scaler` is provided, uses GradScaler for mixed precision.
-        Assumes outer code (Train.py) wraps this in torch.cuda.amp.autocast().
+        Assumes outer code wraps this in torch.cuda.amp.autocast().
         """
         if not self.isTrain:
             with torch.no_grad():
                 self.fake_B = self.netG(self.real_A)
             return
-
+    
         use_amp = scaler is not None
-
-        # ------------------ Generator forward ------------------
+    
+        # G forward once
         self.fake_B = self.netG(self.real_A)
-
+    
         # ------------------ D step ------------------
         set_requires_grad(self.netD, True)
         self.optimizer_D.zero_grad(set_to_none=True)
-
+    
         fake_AB = torch.cat((self.real_A, self.fake_B), 1)
         pred_fake = self.netD(fake_AB.detach(), isDetach=True)
         self.loss_D_fake = self.criterionGAN(pred_fake, False)
-
+    
         real_AB = torch.cat((self.real_A, self.real_B), 1)
         pred_real = self.netD(real_AB, isDetach=True)
         self.loss_D_real = self.criterionGAN(pred_real, True)
-
-        self.loss_D_loss = (self.loss_D_fake + self.loss_D_real) * 0.5
-
+    
+        self.loss_D_loss = 0.5 * (self.loss_D_fake + self.loss_D_real)
+    
         if use_amp:
             scaler.scale(self.loss_D_loss).backward()
             scaler.step(self.optimizer_D)
@@ -1979,22 +1979,23 @@ class GANclass(nn.Module):
         else:
             self.loss_D_loss.backward()
             self.optimizer_D.step()
-
+    
         # ------------------ G step ------------------
         set_requires_grad(self.netD, False)
         self.optimizer_G.zero_grad(set_to_none=True)
-
+        
         fake_AB = torch.cat((self.real_A, self.fake_B), 1)
-        pred_fake = self.netD(fake_AB, isDetach=False)
-        self.loss_G_GAN = self.criterionGAN(pred_fake, True)
+        pred_fake_for_G = self.netD(fake_AB, isDetach=False)
+        
+        self.loss_G_GAN = self.criterionGAN(pred_fake_for_G, True)
         self.loss_G_L1 = self.criterionL1(self.fake_B, self.real_B) * self.lambda_L1
-
+        
         if self.VGG_loss:
             self.loss_G_perceive = self.criterionPreLoss(self.fake_B, self.real_B)
             self.loss_G = self.loss_G_GAN + self.loss_G_L1 + self.loss_G_perceive
         else:
             self.loss_G = self.loss_G_GAN + self.loss_G_L1
-
+        
         if use_amp:
             scaler.scale(self.loss_G).backward()
             scaler.step(self.optimizer_G)
@@ -2028,17 +2029,22 @@ def tensor2im3d(image_tensor):
 
 
 def save_networks(opt, save_name, model, epoch):
-    save_filename = '%s.pth' % (save_name)
+    save_filename = f"{save_name}.pth"
     save_path = os.path.join(opt.model_results, save_filename)
+
+    netG_to_save = model.netG.module if hasattr(model, "netG") and isinstance(model.netG, DDP) else model.netG
+    netD_to_save = None
+    if hasattr(model, "netD"):
+        netD_to_save = model.netD.module if isinstance(model.netD, DDP) else model.netD
+
     state = {
-        'epoch': epoch + 1,
-        'netG_state_dict': model.netG.state_dict(),
-        'netD_state_dict': model.netD.state_dict() if hasattr(model, 'netD') else None,
-        'optimizer_G': model.optimizer_G.state_dict() if hasattr(model, 'optimizer_G') else None,
-        'optimizer_D': model.optimizer_D.state_dict() if hasattr(model, 'optimizer_D') else None,
+        "epoch": epoch + 1,
+        "netG_state_dict": netG_to_save.state_dict(),
+        "netD_state_dict": netD_to_save.state_dict() if netD_to_save is not None else None,
+        "optimizer_G": model.optimizer_G.state_dict() if hasattr(model, "optimizer_G") else None,
+        "optimizer_D": model.optimizer_D.state_dict() if hasattr(model, "optimizer_D") else None,
     }
     torch.save(state, save_path)
-
 
 def load_networks(opt, model):
     load_filename = f"{opt.load_name}.pth"
@@ -2336,90 +2342,97 @@ def randomcrop_Npatch(crop_size, crop_Npatch, mri1, ct, ct_mask):
 
 
 class DatasetFromFolder_train(Dataset):
-    """
-    DDP-friendly dataset using EXACT second-script patch extraction and
-    synchronized horizontal flipping (MRI/CT/MASK).
-    """
-
     def __init__(self, opt):
         self.root = opt.image_dir
         self.Max_CT = opt.Max_CT
-
         self.crop_size = [opt.depthSize, opt.ImageSize, opt.ImageSize]
         self.Npatch = opt.Npatch
-        self.ran_num = 1  
+        self.ran_num = 1
 
         self.patient_dirs = sorted(glob.glob(os.path.join(self.root, "*")))
         if len(self.patient_dirs) == 0:
             raise RuntimeError(f"No patients found in {self.root}")
 
-        print(f"[Dataset] Loading {len(self.patient_dirs)} patients...")
+        print(f"[Dataset] Found {len(self.patient_dirs)} patients...")
 
-        self.data = []
+        self.samples = []
         for folder in self.patient_dirs:
             pid = os.path.basename(folder)
-            mr = self._load(folder, "mr")
-            ct = self._load(folder, "ct")
-            mask = self._load(folder, "mask")
 
-            mr_norm = normalization(mr[0], 0, 255).astype(np.float32)
+            mr_path = None
+            ct_path = None
+            mask_path = None
 
-            ct_min = -1000
-            ct_raw = np.clip(ct[0], ct_min, self.Max_CT)
-            ct_raw[mask[0] == 0] = ct_min
-            ct_norm = normalization(ct_raw, ct_min, self.Max_CT).astype(np.float32)
+            for ext in SUPPORTED_EXT:
+                p = os.path.join(folder, f"mr.{ext}")
+                if os.path.exists(p):
+                    mr_path = p
+                    break
 
-            self.data.append({
+            for ext in SUPPORTED_EXT:
+                p = os.path.join(folder, f"ct.{ext}")
+                if os.path.exists(p):
+                    ct_path = p
+                    break
+
+            for ext in SUPPORTED_EXT:
+                p = os.path.join(folder, f"mask.{ext}")
+                if os.path.exists(p):
+                    mask_path = p
+                    break
+
+            if mr_path is None or ct_path is None or mask_path is None:
+                raise FileNotFoundError(f"Missing mr/ct/mask in {folder}")
+
+            self.samples.append({
                 "id": pid,
-                "mr": mr_norm,
-                "ct": ct_norm,
-                "mask": mask[0].astype(np.float32),
-                "spacing": mr[1],
-                "origin": mr[2],
-                "direction": mr[3],
+                "mr_path": mr_path,
+                "ct_path": ct_path,
+                "mask_path": mask_path,
             })
 
-        self.total_patches = len(self.data) * self.Npatch
+        self.total_patches = len(self.samples) * self.Npatch
         print(f"[Dataset] Ready: {self.total_patches} total patches.")
-
-    def _load(self, folder, name):
-        for ext in SUPPORTED_EXT:
-            path = os.path.join(folder, f"{name}.{ext}")
-            if os.path.exists(path):
-                return load_volume(path)
-        raise FileNotFoundError(f"{name} not found in folder {folder}")
 
     def __getitem__(self, idx):
         vol_idx = idx // self.Npatch
-        sample  = self.data[vol_idx]
+        sample = self.samples[vol_idx]
 
-        mr, ct, mask = sample["mr"], sample["ct"], sample["mask"]
+        mr, spacing, origin, direction = load_volume(sample["mr_path"])
+        ct, _, _, _ = load_volume(sample["ct_path"])
+        mask, _, _, _ = load_volume(sample["mask_path"])
+
+        mr = normalization(mr, 0, 255).astype(np.float32)
+
+        ct_min = -1000
+        ct = np.clip(ct, ct_min, self.Max_CT)
+        ct[mask == 0] = ct_min
+        ct = normalization(ct, ct_min, self.Max_CT).astype(np.float32)
+
+        mask = mask.astype(np.float32)
 
         A_np, B_np, M_np = randomcrop_Npatch(
             self.crop_size, self.ran_num, mr, ct, mask
         )
 
-        A = torch.from_numpy(A_np)  
+        A = torch.from_numpy(A_np)
         B = torch.from_numpy(B_np)
         M = torch.from_numpy(M_np)
 
-
         if random.random() < 0.5:
-            A = torch.flip(A, dims=[3])  
+            A = torch.flip(A, dims=[3])
             B = torch.flip(B, dims=[3])
             M = torch.flip(M, dims=[3])
 
         return {
-            "A": A,  # MRI
-            "B": B,  # CT
+            "A": A,
+            "B": B,
             "mask": M,
             "patient_id": sample["id"],
-            "spacing": sample["spacing"],
-            "origin": sample["origin"],
-            "direction": sample["direction"],
+            "spacing": spacing,
+            "origin": origin,
+            "direction": direction,
         }
-
-    # ----------------------------------------------------------------------
 
     def __len__(self):
         return self.total_patches

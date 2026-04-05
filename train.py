@@ -15,18 +15,22 @@ from pynvml import *
 from tensorboardX import SummaryWriter
 from skimage.metrics import structural_similarity, peak_signal_noise_ratio
 import csv
-
+from datetime import timedelta
 from utils import *
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
+world_size, rank = 1, 0
 
 def setup_distributed():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(hours=2)
+        )
         return True, local_rank
     return False, 0
 
@@ -73,7 +77,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", required=True, help="dataset root (each subject folder)")
     parser.add_argument("--output_dir", required=True, help="where predictions saved")
-    parser.add_argument('--gpu', type=str, default='0')
+    parser.add_argument('--gpu', type=str, default='0, 1')
     parser.add_argument('--input_nc', type=int, default=1)
     parser.add_argument('--output_nc', type=int, default=1)
     parser.add_argument('--D_model', type=str, default='wave3DDiscriminator')
@@ -86,13 +90,13 @@ def main():
     parser.add_argument('--init_type', type=str, default='normal')
     parser.add_argument('--init_gain', type=float, default=0.02)
     parser.add_argument('--no_dropout', action='store_true')
-    parser.add_argument('--num_threads', default=32, type=int)
+    parser.add_argument('--num_threads', default=16, type=int)
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--depthSize', type=int, default=48)
     parser.add_argument('--ImageSize', type=int, default=128)
     parser.add_argument('--load_name', type=str, default='latest')
     parser.add_argument('--lambda_L1', type=float, default=20)
-    parser.add_argument('--seed', type=int, default=15)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--VGG_loss', action='store_false')
     parser.add_argument('--isTrain', action='store_false')
     parser.add_argument('--Npatch', type=int, default=24)
@@ -104,7 +108,7 @@ def main():
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--lr_max', type=float, default=0.0002)
     parser.add_argument('--gan_mode', type=str, default='vanilla')
-    parser.add_argument('--loss_pre_dir', type=str, default='weight/vgg19-dcbb9e9d.pth')
+    parser.add_argument('--loss_pre_dir', type=str, default='weights/vgg19-dcbb9e9d.pth')
     parser.add_argument('--Max_CT', type=int, default=2000)
     parser.add_argument('--disx', type=int, default=10120)
 
@@ -158,7 +162,7 @@ def main():
     torch.manual_seed(opt.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(opt.seed)
-        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
     train_set = DatasetFromFolder_train(opt)
@@ -178,24 +182,33 @@ def main():
         batch_size=opt.batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(per_rank_workers > 0),
+        prefetch_factor=2 if per_rank_workers > 0 else None,
         drop_last=True
     )
 
     model = GANclass(opt).to(device)
-
+    
     if not opt.isTrain or opt.continue_train:
         load_networks(opt, model)
-
+    
+    # Wrap sub-networks, NOT the whole GAN controller
     if is_distributed:
-        model = DDP(
-            model,
+        model.netG = DDP(
+            model.netG,
             device_ids=[local_rank],
             output_device=local_rank,
             find_unused_parameters=False
         )
+    
+        if opt.isTrain and hasattr(model, "netD"):
+            model.netD = DDP(
+                model.netD,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False
+            )
 
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
@@ -231,131 +244,125 @@ def main():
 
             total_iters += 1
 
-            model_run = model.module if isinstance(model, DDP) else model
-
+            # controller = underlying GAN object (for accessing optimizers, nets, etc.)
             batch = {
                 k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                 for k, v in data.items()
             }
-
-            model_run.set_input(batch)
-
+            
+            model.set_input(batch)
+            
             with autocast(enabled=(device.type == "cuda")):
-                model_run.forward(epoch, scaler=scaler)
-
+                model(epoch, scaler=scaler)
+            
             if total_iters % opt.print_freq == 0 and is_main_process:
-                losses = get_current_losses(model_run)
-                lr = model_run.optimizer_G.param_groups[0]['lr']
-
+                losses = get_current_losses(model)
+                lr = model.optimizer_G.param_groups[0]['lr']
+            
                 msg = f"(epoch: {epoch}, iters: {i}/{train_size}, lr: {lr:.6f}) "
                 msg += " ".join([f"{k}:{v:.3f}" for k, v in losses.items()])
                 print(msg)
-
+            
                 if train_writer is not None:
                     train_writer.add_scalar("learning_rate", lr, total_iters)
                     for k, v in losses.items():
                         train_writer.add_scalar(k, v, total_iters)
 
-        update_learning_rate(model_run, opt.max_epochs, epoch, opt.lr_max)
 
-        if epoch % 1 == 0 and is_main_process:
-            model_run = model.module if isinstance(model, DDP) else model
-            netG = model_run.netG
+        update_learning_rate(model, opt.max_epochs, epoch, opt.lr_max)
+        
+        if is_distributed:
+            dist.barrier()
+        
+        if epoch % 10 == 0:
+            netG = model.netG.module if isinstance(model.netG, DDP) else model.netG
             was_training = netG.training
             netG.eval()
-
-            epoch_val_MAE = []
-            epoch_val_SSIM = []
-            epoch_val_PSNR = []
-
+        
+            local_sum_MAE = 0.0
+            local_sum_SSIM = 0.0
+            local_sum_PSNR = 0.0
+            local_count = 0
+        
             image_filenames = sorted(glob.glob(os.path.join(opt.val_dir, '*')))
+            if is_distributed:
+                val_subjects = image_filenames[rank::world_size]
+            else:
+                val_subjects = image_filenames
+        
             patch_size = opt.ImageSize
             patch_deep = opt.depthSize
-
+        
             with torch.no_grad():
-                for sub_index, sub in enumerate(image_filenames):
+                for local_idx, sub in enumerate(val_subjects):
                     MR, spacing, origin, direction, ext_mr = load_val_volume(sub, "mr")
                     CT, _, _, _, _ = load_val_volume(sub, "ct")
                     MASK, _, _, _, _ = load_val_volume(sub, "mask")
-
+        
                     MR = normalization(MR, 0, 255).astype(np.float32)
                     z, y, x = np.where(MASK > 0)
-
+        
                     if len(z) < 1:
                         continue
-
+        
                     z_edge1 = np.where((z + patch_deep / 2) > MR.shape[0])
                     z[z_edge1] = MR.shape[0] - patch_deep / 2
-
                     z_edge2 = np.where((z - patch_deep / 2) < 0)
                     z[z_edge2] = patch_deep / 2
-
+        
                     y_edge1 = np.where((y + patch_size / 2) > MR.shape[1])
                     y[y_edge1] = MR.shape[1] - patch_size / 2
-
                     y_edge2 = np.where((y - patch_size / 2) < 0)
                     y[y_edge2] = patch_size / 2
-
+        
                     x_edge1 = np.where((x + patch_size / 2) > MR.shape[2])
                     x[x_edge1] = MR.shape[2] - patch_size / 2
-
                     x_edge2 = np.where((x - patch_size / 2) < 0)
                     x[x_edge2] = patch_size / 2
-
+        
                     MR_ch = MR[None, :, :, :]
-
+        
                     output = np.zeros_like(MASK, dtype=np.float32)
                     count_used = np.zeros_like(MASK, dtype=np.float32) + 0.0001
                     dis = opt.disx
-
-                    for num in range(len(x)):
+        
+                    for num in range(0, len(x), dis):
                         if num % dis == 0:
                             deep = z[num]
                             height = y[num]
                             width = x[num]
-
+        
                             z0 = int(deep - patch_deep / 2)
                             z1 = int(deep + patch_deep / 2)
                             y0 = int(height - patch_size / 2)
                             y1 = int(height + patch_size / 2)
                             x0 = int(width - patch_size / 2)
                             x1 = int(width + patch_size / 2)
-
-                            X_MR = MR_ch[:, z0:z1, y0:y1, x0:x1]  # (1, D, H, W)
-                            X_MR = torch.tensor(X_MR).unsqueeze(0).float().to(device)  # (1,1,D,H,W)
-
+        
+                            X_MR = MR_ch[:, z0:z1, y0:y1, x0:x1]
+                            X_MR = torch.from_numpy(X_MR).unsqueeze(0).to(device, dtype=torch.float32)
+        
                             with autocast(enabled=(device.type == "cuda")):
                                 CT_pred = netG(X_MR)
-
-                            CT_pred = np.squeeze(CT_pred.cpu().numpy())
+        
+                            CT_pred = np.squeeze(CT_pred.detach().float().cpu().numpy())
                             CT_pred[CT_pred < -1] = -1
                             CT_pred[CT_pred > 1] = 1
-
+        
                             output[z0:z1, y0:y1, x0:x1] += CT_pred
                             count_used[z0:z1, y0:y1, x0:x1] += 1.0
-
+        
                     output = output / count_used
                     output[MASK == 0] = -1
                     output_hu = inverser_norm_ct(output, opt.Max_CT, -1000)
                     output_hu = np.clip(output_hu, -1000, opt.Max_CT)
-
-                    out_mr = f"{opt.sample_img_dir}/mr_{epoch}_sub{sub_index}.{ext_mr}"
-                    out_ct = f"{opt.sample_img_dir}/ct_{epoch}_sub{sub_index}.{ext_mr}"
-
-                    if ext_mr == "nii.gz":
-                        NiiDataWrite(out_mr, MR, spacing, origin, direction)
-                        NiiDataWrite(out_ct, output_hu, spacing, origin, direction)
-                    else:
-                        mha_write(out_mr, MR, spacing, origin, direction)
-                        mha_write(out_ct, output_hu, spacing, origin, direction)
-
+        
                     ct_fg = CT[MASK > 0].astype(np.float32)
                     pr_fg = output_hu[MASK > 0].astype(np.float32)
-
+        
                     MAE = np.mean(np.abs(pr_fg - ct_fg))
-
                     data_range = CT.max() - CT.min() if CT.max() > CT.min() else opt.Max_CT + 1000
-
+        
                     SSIM = structural_similarity(
                         CT.astype(np.float32),
                         output_hu.astype(np.float32),
@@ -367,41 +374,60 @@ def main():
                         output_hu.astype(np.float32),
                         data_range=data_range,
                     )
-
+        
                     print(
-                        f"epoch[{epoch}] sub[{sub_index}/{len(image_filenames)}] "
+                        f"[rank {rank}] epoch[{epoch}] sub[{local_idx}/{len(val_subjects)}] "
                         f"MAE={MAE:.3f} SSIM={SSIM:.3f} PSNR={PSNR:.3f}"
                     )
-
-                    epoch_val_MAE.append(MAE)
-                    epoch_val_SSIM.append(SSIM)
-                    epoch_val_PSNR.append(PSNR)
-
+        
+                    local_sum_MAE += float(MAE)
+                    local_sum_SSIM += float(SSIM)
+                    local_sum_PSNR += float(PSNR)
+                    local_count += 1
+        
             netG.train(was_training)
-
-            if len(epoch_val_MAE) > 0:
-                mean_MAE = np.mean(epoch_val_MAE)
-                mean_SSIM = np.mean(epoch_val_SSIM)
-                mean_PSNR = np.mean(epoch_val_PSNR)
+        
+            if is_distributed:
+                stats = torch.tensor(
+                    [local_sum_MAE, local_sum_SSIM, local_sum_PSNR, local_count],
+                    device=device,
+                    dtype=torch.float64,
+                )
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                total_sum_MAE, total_sum_SSIM, total_sum_PSNR, total_count = stats.tolist()
             else:
-                mean_MAE = mean_SSIM = mean_PSNR = 0.0
-
-            if val_writer:
-                val_writer.add_scalar("MAE", mean_MAE, epoch)
-                val_writer.add_scalar("SSIM", mean_SSIM, epoch)
-                val_writer.add_scalar("PSNR", mean_PSNR, epoch)
-
-            save_model = model.module if isinstance(model, DDP) else model
-
-            if mean_MAE < best_MAE:
-                best_MAE = mean_MAE
-                save_networks(opt, "best_MAE", save_model, epoch)
-
-            best_val_SSIM = max(best_val_SSIM, mean_SSIM)
-            best_val_PSNR = max(best_val_PSNR, mean_PSNR)
-
-            save_networks(opt, "latest", save_model, epoch)
-            print(f"[Checkpoint Saved] MAE={mean_MAE:.4f}")
+                total_sum_MAE = local_sum_MAE
+                total_sum_SSIM = local_sum_SSIM
+                total_sum_PSNR = local_sum_PSNR
+                total_count = local_count
+        
+            if is_main_process:
+                if total_count > 0:
+                    mean_MAE = total_sum_MAE / total_count
+                    mean_SSIM = total_sum_SSIM / total_count
+                    mean_PSNR = total_sum_PSNR / total_count
+                else:
+                    mean_MAE = mean_SSIM = mean_PSNR = 0.0
+        
+                if val_writer:
+                    val_writer.add_scalar("MAE", mean_MAE, epoch)
+                    val_writer.add_scalar("SSIM", mean_SSIM, epoch)
+                    val_writer.add_scalar("PSNR", mean_PSNR, epoch)
+        
+                save_model = model
+        
+                if mean_MAE < best_MAE:
+                    best_MAE = mean_MAE
+                    save_networks(opt, "best_MAE", save_model, epoch)
+        
+                best_val_SSIM = max(best_val_SSIM, mean_SSIM)
+                best_val_PSNR = max(best_val_PSNR, mean_PSNR)
+        
+                save_networks(opt, "latest", save_model, epoch)
+                print(f"[Checkpoint Saved] MAE={mean_MAE:.4f}")
+                
+        if is_distributed:
+            dist.barrier()
 
         if is_main_process:
             elapsed = time.time() - epoch_start_time
@@ -455,3 +481,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
